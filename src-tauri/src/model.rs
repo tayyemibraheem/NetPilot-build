@@ -379,6 +379,9 @@ pub fn identity_changed(c: &Config, f: &[u8]) -> bool {
     };
     expected.is_some_and(|s| mac(s).map_or(true, |m| f[22..28] != m))
 }
+/// Limit (KiB/s) at or above which a direction is treated as unpaced "monitor" mode: frames are
+/// forwarded immediately without queue pacing, so monitoring does not itself cause packet loss.
+pub const UNLIMITED: u32 = 125_000;
 pub struct Queue {
     rate: u32,
     next: Instant,
@@ -395,6 +398,18 @@ impl Queue {
         }
     }
     pub fn enqueue(&mut self, frame: Vec<u8>, now: Instant) -> bool {
+        // Monitor mode: at (or above) the documented maximum, forward immediately with no
+        // pacing. Low limits otherwise drop frames once the queue fills, which stalls TCP and
+        // makes a device look disconnected; monitoring should never introduce that loss. A
+        // large safety cap still prevents a sudden burst from exhausting memory.
+        if self.rate >= UNLIMITED {
+            if self.bytes + frame.len() > 8 * 1024 * 1024 {
+                return false;
+            }
+            self.bytes += frame.len();
+            self.frames.push_back((now, frame));
+            return true;
+        }
         let due = self.next.max(now)
             + Duration::from_secs_f64(frame.len() as f64 / (self.rate as f64 * 1024.));
         if self.bytes + frame.len() > 1024 * 1024
@@ -663,6 +678,19 @@ mod tests {
         );
         assert_eq!(up.pop(now + Duration::from_secs(1)).unwrap().len(), 10240);
         assert!(!up.enqueue(vec![0; 30000], now));
+    }
+    #[test]
+    fn monitor_mode_forwards_immediately_without_pacing() {
+        let now = Instant::now();
+        let mut monitor = Queue::new(UNLIMITED, now);
+        // A burst that the low-rate queue would reject must forward at once and keep no backlog.
+        for _ in 0..200 {
+            assert!(monitor.enqueue(vec![0; 1500], now));
+        }
+        for _ in 0..200 {
+            assert_eq!(monitor.pop(now).unwrap().len(), 1500);
+        }
+        assert!(monitor.pop(now).is_none());
     }
     #[test]
     fn live_block_clears_queued_frames_and_unblock_restarts_forwarding() {

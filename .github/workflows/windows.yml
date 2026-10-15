@@ -22,6 +22,18 @@ jobs:
           $private = gh api "repos/$env:GITHUB_REPOSITORY" --jq '.private'
           if ($LASTEXITCODE -ne 0 -or $private -ne 'false') { throw 'Expected the approved public build mirror.' }
       - uses: actions/checkout@v4
+      - name: Stamp an increasing build version
+        shell: pwsh
+        run: |
+          # Each build gets a higher patch (0.1.<run number>) so an installed build can detect a
+          # newer one. Without this every build was 0.1.1 and "Check for updates" always reported
+          # up to date. create-update.mjs reads this same version into latest.json.
+          $version = "0.1.$env:GITHUB_RUN_NUMBER"
+          $conf = 'src-tauri/tauri.conf.json'
+          (Get-Content $conf -Raw) -replace '"version": "\d+\.\d+\.\d+"', ('"version": "' + $version + '"') | Set-Content $conf -NoNewline
+          (Get-Content 'src/main.tsx' -Raw) -replace "const VERSION='[^']*'", ("const VERSION='" + $version + "'") | Set-Content 'src/main.tsx' -NoNewline
+          if ((Get-Content $conf -Raw) -notmatch [regex]::Escape('"version": "' + $version + '"')) { throw 'Version stamp failed.' }
+          Write-Host "Stamped build version $version"
       - uses: actions/setup-node@v4
         with:
           node-version: 22

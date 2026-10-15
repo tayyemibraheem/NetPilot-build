@@ -128,8 +128,10 @@ pub fn probe_subnet(index: u32, owned_network_confirmed: bool) -> Result<Scan, S
     let found = Arc::new(Mutex::new(vec![]));
     let completed = Arc::new(AtomicUsize::new(0));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // Each SendARP blocks ~1s for a silent host, so sweep width dominates discovery time.
+    // Widen it well past the old 16 to shorten a /24 sweep without flooding a home LAN.
     std::thread::scope(|scope| {
-        for _ in 0..16 {
+        for _ in 0..64 {
             let next = next.clone();
             let found = found.clone();
             let completed = completed.clone();
