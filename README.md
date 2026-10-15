@@ -21,7 +21,7 @@ The earlier explicit proxy experiment is preserved locally on branch `experiment
 
 **IPv6 is neither redirected nor blocked.** No claim of complete internet blocking is made. IPv4 traffic that does not traverse the PC is not controlled. Direct local-LAN traffic generally does not use the gateway and is not covered. VLAN-tagged, non-Ethernet and non-IPv4 frames are not forwarded by the engine. Static ARP, anti-spoof protections, client isolation, extender proxying, captive portals or asymmetric paths can prevent enforcement. No app can infer full-device control from a zero counter.
 
-The user's topology is router Wi-Fi → extender → Ethernet Windows PC; other devices may be on the main router. The extender may bridge source MACs transparently, proxy them, or isolate clients. Distinct device and gateway MACs are a prerequisite here, **not a guarantee** that targeted ARP replies and relayed frames cross the extender. This must be tested with one owned device first. NetPilot does not modify router configuration or require device proxy settings, but deliberately changes temporary ARP mappings during a running experiment.
+The target topology is router Wi-Fi → extender → Ethernet Windows PC; other devices may be on the main router. The extender may bridge source MACs transparently, proxy them, or isolate clients. Distinct device and gateway MACs are a prerequisite here, **not a guarantee** that targeted ARP replies and relayed frames cross the extender. This must be tested with one owned device first. NetPilot does not modify router configuration or require device proxy settings, but deliberately changes temporary ARP mappings during a running experiment.
 
 ## Recovery design and limits
 
@@ -44,7 +44,7 @@ A successful Npcap send confirms transmission submission, **not acceptance by th
 
 ## Build and CI
 
-Per user instruction, no application compilation/builds are performed on the Mac. Windows Actions is manually dispatched and builds an unsigned NSIS installer. The workflow runs frontend typechecking/build, Rust formatting, portable packet/recovery/queue tests, and Windows bundling, then attaches the installer, SHA256 checksum and README to an unpublished draft release inside the private build repository. CI does **not** run ARP redirection, install Npcap, or test the home network.
+Per user instruction, no application compilation/builds are performed on the Mac. Windows Actions is manually dispatched and builds an unsigned NSIS installer. The workflow runs frontend typechecking/build, Rust formatting, portable packet/recovery/queue tests, and Windows bundling, then attaches the installer, SHA256 checksum and README to an experimental prerelease inside the explicitly approved public build repository. CI does **not** run ARP redirection, install Npcap, or test the home network.
 
 Developer prerequisites for Windows: Node 22 LTS, stable Rust MSVC, Visual Studio C++ desktop build tools and Windows SDK. Commands on Windows:
 
@@ -55,9 +55,9 @@ cargo test --manifest-path src-tauri/Cargo.toml
 npm run tauri build
 ```
 
-Output: `src-tauri/target/release/bundle/nsis/`. Builds are unsigned and may trigger Windows trust prompts. No public release is created. The workflow verifies repository privacy before building and again before delivery, and keeps the draft unpublished. This uses the supported release-asset channel rather than Actions artifact storage; no other projects' artifacts are deleted and no paid storage is enabled.
+Output: `src-tauri/target/release/bundle/nsis/`. Builds are unsigned and may trigger Windows trust prompts. The user explicitly authorized public visibility and a public rebuild for the build mirror. The workflow checks the approved public mirror before building and uses a prerelease for experimental installers. This uses the supported release-asset channel rather than Actions artifact storage; no other projects' artifacts are deleted and no paid storage is enabled.
 
-Main private source: [MrTayyem/NetPilot](https://github.com/MrTayyem/NetPilot). Build mirror: [tayyemibraheem/NetPilot-build](https://github.com/tayyemibraheem/NetPilot-build). Both must remain private; synchronization is an explicit push of the same source commit, with no cross-account credentials stored in the repository. No automatic token-based mirroring is configured.
+Main private source: [MrTayyem/NetPilot](https://github.com/MrTayyem/NetPilot). Build mirror: [tayyemibraheem/NetPilot-build](https://github.com/tayyemibraheem/NetPilot-build). The main repository remains private; the build mirror and its source/history are public by explicit user request. Synchronization is an explicit push of the same source commit, with no cross-account credentials stored in the repository. No automatic token-based mirroring is configured.
 
 ## First Windows live validation
 
