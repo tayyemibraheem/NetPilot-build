@@ -1,0 +1,30 @@
+name: Windows validation and installer
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+      - name: Test Rust networking and discovery
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Build Windows installer
+        run: npm run tauri build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NetPilot-windows-unsigned
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14
