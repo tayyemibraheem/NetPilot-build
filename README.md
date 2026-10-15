@@ -44,7 +44,7 @@ A successful Npcap send confirms transmission submission, **not acceptance by th
 
 ## Build and CI
 
-Per user instruction, no application compilation/builds are performed on the Mac. Windows Actions is manually dispatched and builds an unsigned NSIS installer. The workflow runs frontend typechecking/build, Rust formatting, portable packet/recovery/queue tests, and Windows bundling, then stores private artifacts for 14 days. CI does **not** run ARP redirection, install Npcap, or test the home network.
+Per user instruction, no application compilation/builds are performed on the Mac. Windows Actions is manually dispatched and builds an unsigned NSIS installer. The workflow runs frontend typechecking/build, Rust formatting, portable packet/recovery/queue tests, and Windows bundling, then attaches the installer, SHA256 checksum and README to an unpublished draft release inside the private build repository. CI does **not** run ARP redirection, install Npcap, or test the home network.
 
 Developer prerequisites for Windows: Node 22 LTS, stable Rust MSVC, Visual Studio C++ desktop build tools and Windows SDK. Commands on Windows:
 
@@ -55,9 +55,9 @@ cargo test --manifest-path src-tauri/Cargo.toml
 npm run tauri build
 ```
 
-Output: `src-tauri/target/release/bundle/nsis/`. Builds are unsigned and may trigger Windows trust prompts. No public release is created.
+Output: `src-tauri/target/release/bundle/nsis/`. Builds are unsigned and may trigger Windows trust prompts. No public release is created. The workflow verifies repository privacy before building and again before delivery, and keeps the draft unpublished. This uses the supported release-asset channel rather than Actions artifact storage; no other projects' artifacts are deleted and no paid storage is enabled.
 
-Main private source: [MrTayyem/NetPilot](https://github.com/MrTayyem/NetPilot). Build mirror, when created: `tayyemibraheem/NetPilot-build`. Both must remain private; synchronization is an explicit push of the same source commit, with no cross-account credentials stored in the repository. No automatic token-based mirroring is configured.
+Main private source: [MrTayyem/NetPilot](https://github.com/MrTayyem/NetPilot). Build mirror: [tayyemibraheem/NetPilot-build](https://github.com/tayyemibraheem/NetPilot-build). Both must remain private; synchronization is an explicit push of the same source commit, with no cross-account credentials stored in the repository. No automatic token-based mirroring is configured.
 
 ## First Windows live validation
 
