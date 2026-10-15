@@ -232,7 +232,7 @@ fn guardian() -> Result<(), String> {
 }
 #[cfg(windows)]
 fn engine() -> Result<(), String> {
-    use crate::model::{Counters, Direction, Queue};
+    use crate::model::Relay;
     let (c, input) = read_config()?;
     crate::pcap::require_admin()?;
     // Guardian already validated current identities before poisoning; engine rechecks config only.
@@ -252,23 +252,7 @@ fn engine() -> Result<(), String> {
         config: &c,
     };
     let now = Instant::now();
-    let mut queues: Vec<_> = c
-        .rules
-        .iter()
-        .map(|r| [Queue::new(r.upload, now), Queue::new(r.download, now)])
-        .collect();
-    let mut runtime = c.rules.clone();
-    let mut stats: Vec<_> = c
-        .rules
-        .iter()
-        .map(|r| Counters {
-            ip: r.ip.to_string(),
-            blocked: r.blocked,
-            upload_limit: r.upload,
-            download_limit: r.download,
-            ..Default::default()
-        })
-        .collect();
+    let mut relay = Relay::new(&c, now);
     let deadline = now + Duration::from_secs(c.duration_minutes as u64 * 60);
     let mut arp_at = now;
     let mut stats_at = now;
@@ -279,23 +263,7 @@ fn engine() -> Result<(), String> {
             break;
         }
         for update in heart.updates.try_iter() {
-            update.validate(&c)?;
-            let i = runtime
-                .iter()
-                .position(|r| r.ip == update.ip)
-                .ok_or("Device not enrolled")?;
-            stats[i].dropped +=
-                (queues[i][0].pending_packets() + queues[i][1].pending_packets()) as u64;
-            runtime[i].upload = update.upload;
-            runtime[i].download = update.download;
-            runtime[i].blocked = update.blocked;
-            queues[i] = [
-                Queue::new(update.upload, Instant::now()),
-                Queue::new(update.download, Instant::now()),
-            ];
-            stats[i].blocked = update.blocked;
-            stats[i].upload_limit = update.upload;
-            stats[i].download_limit = update.download;
+            relay.update(&c, update, Instant::now())?;
         }
         // Bounded drain prevents a busy adapter starving stop, heartbeat or recovery timers.
         for _ in 0..128 {
@@ -306,32 +274,9 @@ fn engine() -> Result<(), String> {
                         .into(),
                 );
             }
-            if let Some((i, d, f)) = crate::model::classify(&c, &frame) {
-                if runtime[i].blocked {
-                    stats[i].dropped += 1;
-                    continue;
-                }
-                let direction = if d == Direction::Upload { 0 } else { 1 };
-                if !queues[i][direction].enqueue(f, Instant::now()) {
-                    stats[i].dropped += 1
-                }
-            }
+            relay.receive(&c, &frame, Instant::now());
         }
-        for (i, pair) in queues.iter_mut().enumerate() {
-            for (d, q) in pair.iter_mut().enumerate() {
-                for _ in 0..128 {
-                    let Some(frame) = q.pop(Instant::now()) else {
-                        break;
-                    };
-                    capture.send(&frame)?;
-                    if d == 0 {
-                        stats[i].upload_bytes += frame.len() as u64
-                    } else {
-                        stats[i].download_bytes += frame.len() as u64
-                    }
-                }
-            }
-        }
+        relay.forward_due(Instant::now(), |f| capture.send(f))?;
         let now = Instant::now();
         if now >= arp_at {
             capture.advertise(&c, false)?;
@@ -342,13 +287,12 @@ fn engine() -> Result<(), String> {
             }
         }
         if now >= stats_at {
-            emit(&Status{phase:"active".into(),message:"IPv4 session active. Counters include only frames this engine forwarded; zero is not proof of enforcement.".into(),counters:stats.clone()});
+            emit(&Status{phase:"active".into(),message:"IPv4 session active. Counters include only frames this engine forwarded; zero is not proof of enforcement.".into(),counters:relay.stats.clone()});
             stats_at = now + Duration::from_secs(1)
         }
-        let next = queues
-            .iter()
-            .flat_map(|q| q.iter())
-            .filter_map(|q| q.due())
+        let next = relay
+            .next_due()
+            .into_iter()
             .chain([arp_at, stats_at, deadline])
             .min()
             .unwrap_or(now + Duration::from_millis(100));

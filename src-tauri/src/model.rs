@@ -294,6 +294,88 @@ impl Queue {
         Some(f)
     }
 }
+/// Offline-testable forwarding and live rule state; native code supplies only I/O.
+pub struct Relay {
+    queues: Vec<[Queue; 2]>,
+    rules: Vec<Rule>,
+    pub stats: Vec<Counters>,
+}
+impl Relay {
+    pub fn new(c: &Config, now: Instant) -> Self {
+        Self {
+            queues: c
+                .rules
+                .iter()
+                .map(|r| [Queue::new(r.upload, now), Queue::new(r.download, now)])
+                .collect(),
+            rules: c.rules.clone(),
+            stats: c
+                .rules
+                .iter()
+                .map(|r| Counters {
+                    ip: r.ip.to_string(),
+                    blocked: r.blocked,
+                    upload_limit: r.upload,
+                    download_limit: r.download,
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
+    pub fn receive(&mut self, c: &Config, frame: &[u8], now: Instant) {
+        if let Some((i, d, f)) = classify(c, frame) {
+            let direction = if d == Direction::Upload { 0 } else { 1 };
+            if self.rules[i].blocked || !self.queues[i][direction].enqueue(f, now) {
+                self.stats[i].dropped += 1
+            }
+        }
+    }
+    pub fn update(&mut self, c: &Config, u: Update, now: Instant) -> Result<(), String> {
+        u.validate(c)?;
+        let i = self
+            .rules
+            .iter()
+            .position(|r| r.ip == u.ip)
+            .ok_or("Device not enrolled")?;
+        self.stats[i].dropped +=
+            (self.queues[i][0].pending_packets() + self.queues[i][1].pending_packets()) as u64;
+        self.rules[i].upload = u.upload;
+        self.rules[i].download = u.download;
+        self.rules[i].blocked = u.blocked;
+        self.queues[i] = [Queue::new(u.upload, now), Queue::new(u.download, now)];
+        self.stats[i].blocked = u.blocked;
+        self.stats[i].upload_limit = u.upload;
+        self.stats[i].download_limit = u.download;
+        Ok(())
+    }
+    pub fn forward_due(
+        &mut self,
+        now: Instant,
+        mut send: impl FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for (i, pair) in self.queues.iter_mut().enumerate() {
+            for (d, q) in pair.iter_mut().enumerate() {
+                for _ in 0..128 {
+                    let Some(frame) = q.pop(now) else { break };
+                    send(&frame)?;
+                    if d == 0 {
+                        self.stats[i].upload_bytes += frame.len() as u64
+                    } else {
+                        self.stats[i].download_bytes += frame.len() as u64
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn next_due(&self) -> Option<Instant> {
+        self.queues
+            .iter()
+            .flat_map(|q| q.iter())
+            .filter_map(|q| q.due())
+            .min()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +503,88 @@ mod tests {
         );
         assert_eq!(up.pop(now + Duration::from_secs(1)).unwrap().len(), 10240);
         assert!(!up.enqueue(vec![0; 30000], now));
+    }
+    #[test]
+    fn live_block_clears_queued_frames_and_unblock_restarts_forwarding() {
+        let c = config();
+        let now = Instant::now();
+        let mut relay = Relay::new(&c, now);
+        let f = ipv4(&c, false);
+        relay.receive(&c, &f, now);
+        relay
+            .update(
+                &c,
+                Update {
+                    ip: c.rules[0].ip,
+                    upload: 10,
+                    download: 20,
+                    blocked: true,
+                },
+                now,
+            )
+            .unwrap();
+        relay.receive(&c, &f, now);
+        let mut sent = 0;
+        relay
+            .forward_due(now + Duration::from_secs(1), |_| {
+                sent += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(sent, 0);
+        assert_eq!(relay.stats[0].dropped, 2);
+        assert!(relay.stats[0].blocked);
+        relay
+            .update(
+                &c,
+                Update {
+                    ip: c.rules[0].ip,
+                    upload: 30,
+                    download: 40,
+                    blocked: false,
+                },
+                now,
+            )
+            .unwrap();
+        relay.receive(&c, &f, now);
+        relay
+            .forward_due(now + Duration::from_secs(1), |_| {
+                sent += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(sent, 1);
+        assert_eq!(relay.stats[0].upload_bytes, 100);
+        assert_eq!(relay.stats[0].download_bytes, 0);
+        assert_eq!(relay.stats[0].upload_limit, 30);
+        assert!(!relay.stats[0].blocked);
+    }
+    #[test]
+    fn aggregate_frame_pacing_and_directional_counts() {
+        let c = config();
+        let now = Instant::now();
+        let mut relay = Relay::new(&c, now);
+        for _ in 0..10 {
+            relay.receive(&c, &ipv4(&c, false), now);
+            relay.receive(&c, &ipv4(&c, true), now)
+        }
+        relay
+            .forward_due(now + Duration::from_millis(50), |_| Ok(()))
+            .unwrap();
+        assert_eq!(relay.stats[0].upload_bytes, 500);
+        assert_eq!(relay.stats[0].download_bytes, 1000);
+    }
+    #[test]
+    fn failed_transmit_does_not_increment_forwarded_bytes() {
+        let c = config();
+        let now = Instant::now();
+        let mut relay = Relay::new(&c, now);
+        relay.receive(&c, &ipv4(&c, false), now);
+        assert!(relay
+            .forward_due(now + Duration::from_secs(1), |_| Err(
+                "driver failure".into()
+            ))
+            .is_err());
+        assert_eq!(relay.stats[0].upload_bytes, 0);
     }
 }
