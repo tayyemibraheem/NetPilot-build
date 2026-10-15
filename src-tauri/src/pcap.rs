@@ -334,10 +334,22 @@ impl Capture {
         }
     }
     pub fn send(&self, packet: &[u8]) -> Result<(), String> {
-        if unsafe { (self.send)(self.handle, packet.as_ptr(), packet.len() as c_int) } != 0 {
-            Err(format!("pcap_sendpacket: {}", self.last_error()))
-        } else {
-            Ok(())
+        // A momentary transient driver condition (e.g. the NIC briefly busy) should not tear
+        // down a running session, so retry a bounded number of times. A vanished adapter
+        // (device-not-found) is NOT transient and must fail fast so recovery runs immediately;
+        // continuing to redirect ARP while unable to forward would strand the selected device.
+        let mut attempts = 0u8;
+        loop {
+            if unsafe { (self.send)(self.handle, packet.as_ptr(), packet.len() as c_int) } == 0 {
+                return Ok(());
+            }
+            let detail = self.last_error();
+            let (message, transient) = classify_send_error(&detail);
+            attempts += 1;
+            if !transient || attempts >= 3 {
+                return Err(message);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
     pub fn next(&self) -> Result<Option<Vec<u8>>, String> {
@@ -399,6 +411,31 @@ impl Drop for Capture {
         unsafe { (self.close)(self.handle) }
     }
 }
+/// Classify an Npcap send failure into a user-facing message and whether it is worth retrying.
+/// The Npcap error string ends with a parenthesised Win32 code, e.g. "... (20)". Code 20 is
+/// ERROR_FILE_NOT_FOUND: the adapter the handle points at is gone (disabled, unplugged, link
+/// lost, or power-managed). That is terminal for the session; most other codes are treated as
+/// transient and retried a few times before failing.
+fn classify_send_error(detail: &str) -> (String, bool) {
+    let code = detail
+        .rsplit('(')
+        .next()
+        .and_then(|tail| tail.split(')').next())
+        .and_then(|digits| digits.trim().parse::<u32>().ok());
+    match code {
+        // ERROR_FILE_NOT_FOUND (20) / ERROR_DEV_NOT_EXIST (55): the device is no longer present.
+        Some(20) | Some(55) => (
+            format!(
+                "[NP_ADAPTER_GONE] The selected adapter became unavailable mid-session \
+                 (disabled, unplugged, link lost, or power-managed). Check the NIC's power \
+                 management settings (and USB selective suspend for a USB adapter) and cabling, \
+                 then start again. Npcap reported: pcap_sendpacket: {detail}"
+            ),
+            false,
+        ),
+        _ => (format!("pcap_sendpacket: {detail}"), true),
+    }
+}
 fn capture_filter(c: &Config) -> Result<String, String> {
     use crate::model::{mac, mac_text};
     let gateway = mac_text(mac(&c.gateway_mac)?);
@@ -458,5 +495,33 @@ impl Drop for SessionLock {
             ReleaseMutex(self.0);
             CloseHandle(self.0);
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::classify_send_error;
+    #[test]
+    fn device_not_found_is_terminal() {
+        let (message, transient) = classify_send_error(
+            "send error: PacketSendPacket failed: The system cannot find the device specified.  (20)",
+        );
+        assert!(!transient, "device-not-found must fail fast into recovery");
+        assert!(message.contains("NP_ADAPTER_GONE"));
+    }
+    #[test]
+    fn device_not_exist_is_terminal() {
+        let (_m, transient) = classify_send_error("whatever (55)");
+        assert!(!transient);
+    }
+    #[test]
+    fn other_errors_are_transient() {
+        let (message, transient) = classify_send_error("temporary failure (6)");
+        assert!(transient, "unknown codes are retried before giving up");
+        assert!(message.starts_with("pcap_sendpacket:"));
+    }
+    #[test]
+    fn missing_code_is_transient() {
+        let (_m, transient) = classify_send_error("some error with no parenthesised code");
+        assert!(transient);
     }
 }
