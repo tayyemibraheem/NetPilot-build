@@ -222,6 +222,11 @@ pub fn measured_rate(bytes: u64, elapsed: Duration) -> Option<f64> {
         Some(bytes as f64 / 1024. / elapsed.as_secs_f64())
     }
 }
+/// Match the explicitly chosen Windows GUID, then use the driver's exact device name.
+pub fn capture_device_name(guid: &str, candidates: &[String]) -> Result<String, String> {
+    let expected = format!("\\Device\\NPF_{{{}}}", guid.trim_matches(['{', '}']));
+    candidates.iter().find(|name|name.eq_ignore_ascii_case(&expected)).cloned().ok_or_else(||"[NP_ADAPTER_BINDING] The selected Windows adapter is not in Npcap's capture-device list. Keep the same selected adapter; check its Npcap binding/driver installation and recheck setup. No different adapter was substituted.".into())
+}
 pub fn subnet(ip: Ipv4Addr, other: Ipv4Addr, prefix: u8) -> bool {
     if prefix == 0 || prefix > 32 {
         return false;
@@ -808,5 +813,25 @@ mod tests {
         assert_eq!(relay.stats[0].forwarded_upload_kib_s, Some(0.));
         relay.sample_rates(now + Duration::from_secs(3));
         assert_eq!(relay.stats[0].observed_upload_kib_s, Some(0.));
+    }
+    #[test]
+    fn capture_selection_uses_exact_driver_name_for_only_the_selected_guid() {
+        let guid = "AB000000-0000-4000-8000-000000000001";
+        let actual = "\\Device\\NPF_{ab000000-0000-4000-8000-000000000001}".to_string();
+        let other = "\\Device\\NPF_{ab000000-0000-4000-8000-000000000002}".to_string();
+        assert_eq!(
+            capture_device_name(
+                guid,
+                &[
+                    "\\Device\\NPF_Loopback".into(),
+                    other.clone(),
+                    actual.clone()
+                ]
+            )
+            .unwrap(),
+            actual
+        );
+        assert!(capture_device_name(guid, &[other]).is_err());
+        assert!(capture_device_name(guid, &[]).is_err());
     }
 }

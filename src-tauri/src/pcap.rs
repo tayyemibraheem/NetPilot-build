@@ -181,6 +181,46 @@ pub fn open_official_download() -> Result<(), String> {
         Ok(())
     }
 }
+#[repr(C)]
+struct Device {
+    next: *mut Device,
+    name: *mut c_char,
+    description: *mut c_char,
+    addresses: *mut c_void,
+    flags: u32,
+}
+fn device_name(library: &libloading::os::windows::Library, guid: &str) -> Result<String, String> {
+    unsafe {
+        let find: unsafe extern "C" fn(*mut *mut Device, *mut c_char) -> c_int = *library
+            .get(b"pcap_findalldevs\0")
+            .map_err(|e| e.to_string())?;
+        let free: unsafe extern "C" fn(*mut Device) = *library
+            .get(b"pcap_freealldevs\0")
+            .map_err(|e| e.to_string())?;
+        let mut first = ptr::null_mut();
+        let mut error = [0i8; 256];
+        if find(&mut first, error.as_mut_ptr()) != 0 {
+            return Err(format!(
+                "[NP_ADAPTER_ENUM] {}",
+                CStr::from_ptr(error.as_ptr()).to_string_lossy()
+            ));
+        }
+        let mut current = first;
+        let mut names = vec![];
+        // The list is driver-owned and freed after copying names. Never retain pointers into it.
+        while !current.is_null() && names.len() < 4096 {
+            let device = &*current;
+            if !device.name.is_null() {
+                names.push(CStr::from_ptr(device.name).to_string_lossy().into_owned())
+            }
+            current = device.next;
+        }
+        if !first.is_null() {
+            free(first)
+        }
+        crate::model::capture_device_name(guid, &names)
+    }
+}
 pub struct Capture {
     handle: Handle,
     send: Send,
@@ -210,7 +250,8 @@ impl Capture {
             let nonblock: unsafe extern "C" fn(Handle, c_int, *mut c_char) -> c_int = *library
                 .get(b"pcap_setnonblock\0")
                 .map_err(|e| e.to_string())?;
-            let name = CString::new(c.npf_name()).map_err(|e| e.to_string())?;
+            let name =
+                CString::new(device_name(&library, &c.adapter.guid)?).map_err(|e| e.to_string())?;
             let mut err = [0i8; 256];
             let handle = open(name.as_ptr(), 65535, 0, 1, err.as_mut_ptr());
             if handle.is_null() {
