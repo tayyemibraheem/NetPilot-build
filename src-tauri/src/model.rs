@@ -83,12 +83,40 @@ pub struct Counters {
     pub blocked: bool,
     pub upload_limit: u32,
     pub download_limit: u32,
+    pub observed_upload_bytes: u64,
+    pub observed_download_bytes: u64,
+    pub observed_upload_kib_s: Option<f64>,
+    pub observed_download_kib_s: Option<f64>,
+    pub forwarded_upload_kib_s: Option<f64>,
+    pub forwarded_download_kib_s: Option<f64>,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RecoveryReport {
+    pub mappings: u32,
+    pub attempts: u32,
+    pub submitted: u32,
+    pub failed_attempts: u32,
+    pub unsubmitted_mappings: u32,
+    pub last_error: Option<String>,
+}
+impl RecoveryReport {
+    pub fn summary(&self) -> String {
+        format!("Original ARP mappings submitted for {}/{} mappings; {}/{} send attempts succeeded. Endpoint acceptance is not confirmed.{}",self.mappings-self.unsubmitted_mappings,self.mappings,self.submitted,self.attempts,self.last_error.as_ref().map(|e|format!(" Last recovery error: {e}")).unwrap_or_default())
+    }
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Status {
     pub phase: String,
     pub message: String,
     pub counters: Vec<Counters>,
+    #[serde(default)]
+    pub primary_error: Option<String>,
+    #[serde(default)]
+    pub recovery: Option<RecoveryReport>,
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    #[serde(default)]
+    pub remaining_seconds: Option<u64>,
 }
 impl Default for Status {
     fn default() -> Self {
@@ -96,7 +124,102 @@ impl Default for Status {
             phase: "stopped".into(),
             message: "No interception session is running.".into(),
             counters: vec![],
+            primary_error: None,
+            recovery: None,
+            stop_reason: None,
+            remaining_seconds: None,
         }
+    }
+}
+impl Status {
+    pub fn new(phase: &str, message: impl Into<String>) -> Self {
+        let text = message.into();
+        Self {
+            phase: phase.into(),
+            primary_error: if phase == "error" {
+                Some(text.clone())
+            } else {
+                None
+            },
+            message: text,
+            ..Default::default()
+        }
+    }
+    /// Keep the first failure through cleanup, subsequent errors and helper pipe loss.
+    pub fn absorb(&mut self, mut next: Self) {
+        if self.primary_error.is_some() {
+            next.primary_error = self.primary_error.clone()
+        }
+        if next.recovery.is_none() {
+            next.recovery = self.recovery.clone()
+        }
+        if next.stop_reason.is_none() {
+            next.stop_reason = self.stop_reason.clone()
+        }
+        if next.counters.is_empty() {
+            next.counters = self.counters.clone()
+        }
+        if next.primary_error.is_some() && next.phase == "stopped" {
+            next.phase = "error".into()
+        }
+        if next.phase != "active" {
+            next.remaining_seconds = None
+        }
+        *self = next;
+    }
+}
+/// Submit every recovery mapping even if another mapping fails. No live I/O in this function.
+pub fn restore_with(
+    c: &Config,
+    rounds: u32,
+    mut send: impl FnMut(&[u8]) -> Result<(), String>,
+    mut between: impl FnMut(),
+) -> RecoveryReport {
+    let mut frames = vec![];
+    for r in &c.rules {
+        match arp_pair(c, r, true) {
+            Ok(pair) => frames.extend(pair),
+            Err(e) => {
+                return RecoveryReport {
+                    mappings: (c.rules.len() * 2) as u32,
+                    unsubmitted_mappings: (c.rules.len() * 2) as u32,
+                    last_error: Some(e),
+                    ..Default::default()
+                }
+            }
+        }
+    }
+    let mut report = RecoveryReport {
+        mappings: frames.len() as u32,
+        ..Default::default()
+    };
+    let mut sent = vec![false; frames.len()];
+    for round in 0..rounds {
+        for (i, f) in frames.iter().enumerate() {
+            report.attempts += 1;
+            match send(f) {
+                Ok(()) => {
+                    report.submitted += 1;
+                    sent[i] = true
+                }
+                Err(e) => {
+                    report.failed_attempts += 1;
+                    report.last_error = Some(e)
+                }
+            }
+        }
+        if round + 1 < rounds {
+            between()
+        }
+    }
+    report.unsubmitted_mappings = sent.iter().filter(|s| !**s).count() as u32;
+    report
+}
+pub fn measured_rate(bytes: u64, elapsed: Duration) -> Option<f64> {
+    if elapsed < Duration::from_millis(250) {
+        None
+    } else {
+        Some(bytes as f64 / 1024. / elapsed.as_secs_f64())
     }
 }
 pub fn subnet(ip: Ipv4Addr, other: Ipv4Addr, prefix: u8) -> bool {
@@ -299,10 +422,14 @@ pub struct Relay {
     queues: Vec<[Queue; 2]>,
     rules: Vec<Rule>,
     pub stats: Vec<Counters>,
+    sample_at: Instant,
+    sampled: Vec<[u64; 4]>,
 }
 impl Relay {
     pub fn new(c: &Config, now: Instant) -> Self {
         Self {
+            sample_at: now,
+            sampled: vec![[0; 4]; c.rules.len()],
             queues: c
                 .rules
                 .iter()
@@ -324,6 +451,11 @@ impl Relay {
     }
     pub fn receive(&mut self, c: &Config, frame: &[u8], now: Instant) {
         if let Some((i, d, f)) = classify(c, frame) {
+            if d == Direction::Upload {
+                self.stats[i].observed_upload_bytes += f.len() as u64
+            } else {
+                self.stats[i].observed_download_bytes += f.len() as u64
+            }
             let direction = if d == Direction::Upload { 0 } else { 1 };
             if self.rules[i].blocked || !self.queues[i][direction].enqueue(f, now) {
                 self.stats[i].dropped += 1
@@ -367,6 +499,29 @@ impl Relay {
             }
         }
         Ok(())
+    }
+    pub fn sample_rates(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.sample_at);
+        if elapsed < Duration::from_millis(250) {
+            return;
+        }
+        for (i, c) in self.stats.iter_mut().enumerate() {
+            let totals = [
+                c.observed_upload_bytes,
+                c.observed_download_bytes,
+                c.upload_bytes,
+                c.download_bytes,
+            ];
+            let rates = std::array::from_fn::<_, 4, _>(|j| {
+                measured_rate(totals[j].saturating_sub(self.sampled[i][j]), elapsed)
+            });
+            c.observed_upload_kib_s = rates[0];
+            c.observed_download_kib_s = rates[1];
+            c.forwarded_upload_kib_s = rates[2];
+            c.forwarded_download_kib_s = rates[3];
+            self.sampled[i] = totals;
+        }
+        self.sample_at = now;
     }
     pub fn next_due(&self) -> Option<Instant> {
         self.queues
@@ -586,5 +741,72 @@ mod tests {
             ))
             .is_err());
         assert_eq!(relay.stats[0].upload_bytes, 0);
+    }
+    #[test]
+    fn original_failure_survives_cleanup_and_disconnect() {
+        let mut s = Status::new("error", "[NP_CAPTURE_READ] could not find the device");
+        s.counters = Relay::new(&config(), Instant::now()).stats;
+        s.absorb(Status::new("restoring", "Restoring original mappings"));
+        s.absorb(Status::new("error", "[NP_RECOVERY] restore send failed"));
+        s.absorb(Status::new("stopped", "Cleanup ended"));
+        assert_eq!(
+            s.primary_error.as_deref(),
+            Some("[NP_CAPTURE_READ] could not find the device")
+        );
+        assert_eq!(s.phase, "error");
+        assert_eq!(s.counters.len(), 1);
+    }
+    #[test]
+    fn recovery_attempts_every_mapping_and_recovers_partial_round() {
+        let c = config();
+        let mut calls = 0;
+        let report = restore_with(
+            &c,
+            2,
+            |_| {
+                calls += 1;
+                if calls == 1 {
+                    Err("first send failed".into())
+                } else {
+                    Ok(())
+                }
+            },
+            || {},
+        );
+        assert_eq!(calls, 4);
+        assert_eq!(report.failed_attempts, 1);
+        assert_eq!(report.submitted, 3);
+        assert_eq!(report.unsubmitted_mappings, 0);
+        let report = restore_with(
+            &c,
+            2,
+            |f| {
+                if f[..6] == mac(&c.gateway_mac).unwrap() {
+                    Err("gateway send failed".into())
+                } else {
+                    Ok(())
+                }
+            },
+            || {},
+        );
+        assert_eq!(report.attempts, 4);
+        assert_eq!(report.unsubmitted_mappings, 1);
+    }
+    #[test]
+    fn rates_use_real_elapsed_time_and_measure_attempted_blocked_traffic() {
+        assert_eq!(measured_rate(2048, Duration::from_secs(2)), Some(1.));
+        assert_eq!(measured_rate(1024, Duration::from_millis(100)), None);
+        let mut c = config();
+        c.rules[0].blocked = true;
+        let now = Instant::now();
+        let mut relay = Relay::new(&c, now);
+        for _ in 0..10 {
+            relay.receive(&c, &ipv4(&c, false), now)
+        }
+        relay.sample_rates(now + Duration::from_secs(2));
+        assert_eq!(relay.stats[0].observed_upload_kib_s, Some(1000. / 2048.));
+        assert_eq!(relay.stats[0].forwarded_upload_kib_s, Some(0.));
+        relay.sample_rates(now + Duration::from_secs(3));
+        assert_eq!(relay.stats[0].observed_upload_kib_s, Some(0.));
     }
 }

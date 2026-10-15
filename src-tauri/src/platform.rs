@@ -170,3 +170,138 @@ pub fn probe_subnet(index: u32, owned_network_confirmed: bool) -> Result<Scan, S
         total: count as usize,
     })
 }
+
+#[derive(Serialize)]
+pub struct DriverStatus {
+    pub supported: bool,
+    pub runtime_found: bool,
+    pub administrator: bool,
+    pub version: Option<String>,
+    pub service: String,
+    pub message: String,
+}
+pub fn driver_status() -> DriverStatus {
+    #[cfg(windows)]
+    {
+        crate::pcap::probe()
+    }
+    #[cfg(not(windows))]
+    {
+        DriverStatus {
+            supported: false,
+            runtime_found: false,
+            administrator: false,
+            version: None,
+            service: "unavailable".into(),
+            message: "Npcap setup detection is Windows-only. No Mac networking is started.".into(),
+        }
+    }
+}
+#[derive(Serialize)]
+pub struct DeviceName {
+    pub ip: String,
+    pub hostname: Option<String>,
+}
+#[derive(Serialize)]
+pub struct Names {
+    pub devices: Vec<DeviceName>,
+    pub complete: bool,
+}
+pub fn clean_hostname(name: &str) -> Option<String> {
+    let n = name.trim().trim_end_matches('.');
+    if n.is_empty()
+        || n.len() > 253
+        || n.parse::<std::net::IpAddr>().is_ok()
+        || n.chars().any(char::is_control)
+    {
+        None
+    } else {
+        Some(n.into())
+    }
+}
+#[cfg(windows)]
+pub fn names(index: u32, ips: Vec<std::net::Ipv4Addr>) -> Result<Names, String> {
+    use std::{
+        io::Read,
+        os::windows::process::CommandExt,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    let a = adapters()?
+        .into_iter()
+        .find(|a| a.index == index)
+        .ok_or("Adapter unavailable")?;
+    if ips.len() > 16
+        || ips
+            .iter()
+            .any(|ip| !ip.is_private() || !crate::model::subnet(a.ip, *ip, a.prefix))
+    {
+        return Err("Name queries are limited to 16 private on-link addresses per request.".into());
+    }
+    let args = ips
+        .iter()
+        .map(|ip| format!("'{ip}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        r#"[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); foreach($ip in @({args})){{$name=$null; try{{$answer=Resolve-DnsName -Name $ip -Type PTR -QuickTimeout -ErrorAction Stop | Where-Object {{$_.NameHost}} | Select-Object -First 1; if($answer){{$name=[string]$answer.NameHost}}}}catch{{}}; [pscustomobject]@{{ip=[string]$ip;hostname=$name}} | ConvertTo-Json -Compress}}"#
+    );
+    let mut child = Command::new("powershell.exe")
+        .creation_flags(0x08000000)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut output = child.stdout.take().ok_or("Name query output unavailable")?;
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = output.read_to_string(&mut text);
+        text
+    });
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let complete;
+    loop {
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            complete = true;
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            complete = false;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    #[derive(Deserialize)]
+    struct Row {
+        ip: String,
+        hostname: Option<String>,
+    }
+    let text = reader.join().map_err(|_| "Name query reader failed")?;
+    let devices = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Row>(line.trim_start_matches('\u{feff}')).ok())
+        .map(|r| DeviceName {
+            ip: r.ip,
+            hostname: r.hostname.and_then(|n| clean_hostname(&n)),
+        })
+        .collect();
+    Ok(Names { devices, complete })
+}
+#[cfg(not(windows))]
+pub fn names(_index: u32, _ips: Vec<std::net::Ipv4Addr>) -> Result<Names, String> {
+    Err("Windows name resolution required".into())
+}
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+    #[test]
+    fn unknown_names_are_not_invented() {
+        assert_eq!(clean_hostname("phone.local."), Some("phone.local".into()));
+        assert!(clean_hostname("192.168.1.3").is_none());
+        assert!(clean_hostname("").is_none());
+        assert!(clean_hostname("bad\nname").is_none());
+    }
+}

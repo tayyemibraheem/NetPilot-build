@@ -38,6 +38,149 @@ pub fn require_admin() -> Result<(), String> {
         Ok(())
     }
 }
+fn load_library() -> Result<libloading::os::windows::Library, String> {
+    unsafe {
+        let mut path = vec![0u16; 32768];
+        let n = GetSystemDirectoryW(path.as_mut_ptr(), path.len() as u32) as usize;
+        if n == 0 || n >= path.len() {
+            return Err("Cannot locate Windows system directory".into());
+        }
+        path.truncate(n);
+        let dll = std::path::PathBuf::from(String::from_utf16_lossy(&path))
+            .join("Npcap")
+            .join("wpcap.dll");
+        libloading::os::windows::Library::load_with_flags(&dll,0x100|0x800).map_err(|e|format!("Npcap runtime unavailable: {e}. Install Npcap from its official site, then recheck."))
+    }
+}
+pub fn probe() -> crate::platform::DriverStatus {
+    let admin = require_admin().is_ok();
+    let service = driver_service();
+    match load_library() {
+        Ok(library) => unsafe {
+            let version = library
+                .get::<unsafe extern "C" fn() -> *const c_char>(b"pcap_lib_version\0")
+                .ok()
+                .and_then(|f| {
+                    let p = f();
+                    if p.is_null() {
+                        None
+                    } else {
+                        Some(CStr::from_ptr(p).to_string_lossy().into_owned())
+                    }
+                });
+            let runtime_found = version.as_ref().is_some_and(|v| v.contains("Npcap"));
+            crate::platform::DriverStatus {
+                supported: true,
+                runtime_found,
+                administrator: admin,
+                version,
+                service: service.clone(),
+                message: if runtime_found {
+                    format!("Existing Npcap runtime detected; upgrades reuse it. Driver service: {service}. Capture availability is checked at Start.{}",if admin{""}else{" Relaunch NetPilot as administrator before starting."})
+                } else {
+                    "Installed DLL did not identify itself as Npcap. Use the official Npcap installer.".into()
+                },
+            }
+        },
+        Err(error) => crate::platform::DriverStatus {
+            supported: true,
+            runtime_found: false,
+            administrator: admin,
+            version: None,
+            service,
+            message: error,
+        },
+    }
+}
+fn driver_service() -> String {
+    #[repr(C)]
+    struct State {
+        kind: u32,
+        state: u32,
+        controls: u32,
+        win32_exit: u32,
+        service_exit: u32,
+        checkpoint: u32,
+        wait_hint: u32,
+        pid: u32,
+        flags: u32,
+    }
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenSCManagerW(machine: *const u16, database: *const u16, access: u32) -> Handle;
+        fn OpenServiceW(manager: Handle, name: *const u16, access: u32) -> Handle;
+        fn QueryServiceStatusEx(
+            service: Handle,
+            level: u32,
+            buffer: *mut u8,
+            size: u32,
+            needed: *mut u32,
+        ) -> i32;
+        fn CloseServiceHandle(handle: Handle) -> i32;
+    }
+    unsafe {
+        let manager = OpenSCManagerW(ptr::null(), ptr::null(), 1);
+        if manager.is_null() {
+            return "unknown (service query denied)".into();
+        }
+        let name: Vec<u16> = "npcap\0".encode_utf16().collect();
+        let service = OpenServiceW(manager, name.as_ptr(), 4);
+        CloseServiceHandle(manager);
+        if service.is_null() {
+            return "not found or inaccessible".into();
+        }
+        let mut state: State = std::mem::zeroed();
+        let mut needed = 0;
+        let ok = QueryServiceStatusEx(
+            service,
+            0,
+            (&mut state as *mut State).cast(),
+            std::mem::size_of::<State>() as u32,
+            &mut needed,
+        );
+        CloseServiceHandle(service);
+        if ok == 0 {
+            return "unknown".into();
+        }
+        match state.state {
+            1 => "stopped (may start on capture)".into(),
+            4 => "running".into(),
+            n => format!("state {n}"),
+        }
+    }
+}
+pub fn open_official_download() -> Result<(), String> {
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            window: Handle,
+            verb: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> isize;
+    }
+    let verb: Vec<u16> = "open\0".encode_utf16().collect();
+    let url: Vec<u16> = "https://npcap.com/#download\0".encode_utf16().collect();
+    let code = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            verb.as_ptr(),
+            url.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            1,
+        )
+    };
+    if code <= 32 {
+        Err(format!(
+            "Could not open official download page (Windows {code}). Visit https://npcap.com/"
+        ))
+    } else {
+        Ok(())
+    }
+}
 pub struct Capture {
     handle: Handle,
     send: Send,
@@ -50,23 +193,7 @@ pub struct Capture {
 impl Capture {
     pub fn open(c: &Config, filter: bool) -> Result<Self, String> {
         unsafe {
-            let mut path = vec![0u16; 32768];
-            let n = GetSystemDirectoryW(path.as_mut_ptr(), path.len() as u32) as usize;
-            if n == 0 || n >= path.len() {
-                return Err("Cannot locate Windows system directory".into());
-            }
-            path.truncate(n);
-            let dll = std::path::PathBuf::from(String::from_utf16_lossy(&path))
-                .join("Npcap")
-                .join("wpcap.dll");
-            // Absolute system path; dependencies may load only alongside this DLL or from System32.
-            let library = libloading::os::windows::Library::load_with_flags(&dll, 0x100 | 0x800)
-                .map_err(|e| {
-                    format!(
-                        "Install official Npcap first (not bundled). Could not load {}: {e}",
-                        dll.display()
-                    )
-                })?;
+            let library = load_library()?;
             let open: Open = *library
                 .get(b"pcap_open_live\0")
                 .map_err(|e| e.to_string())?;
@@ -167,7 +294,7 @@ impl Capture {
     }
     pub fn send(&self, packet: &[u8]) -> Result<(), String> {
         if unsafe { (self.send)(self.handle, packet.as_ptr(), packet.len() as c_int) } != 0 {
-            Err(self.last_error())
+            Err(format!("pcap_sendpacket: {}", self.last_error()))
         } else {
             Ok(())
         }
@@ -190,14 +317,20 @@ impl Capture {
                         std::slice::from_raw_parts(data, h.caplen as usize).to_vec(),
                     ))
                 }
-                _ => Err(self.last_error()),
+                code => Err(format!(
+                    "pcap_next_ex returned {code}: {}",
+                    self.last_error()
+                )),
             }
         }
     }
     pub fn wait(&self, millis: u32) -> Result<(), String> {
         match unsafe { WaitForSingleObject(self.event, millis) } {
             0 | 258 => Ok(()),
-            _ => Err("Npcap wait failed".into()),
+            code => Err(format!(
+                "WaitForSingleObject failed ({code}): {}",
+                std::io::Error::last_os_error()
+            )),
         }
     }
     pub fn advertise(&self, c: &Config, restore: bool) -> Result<(), String> {
@@ -208,15 +341,16 @@ impl Capture {
         }
         Ok(())
     }
-    pub fn restore(&self, c: &Config) -> Result<(), String> {
-        let mut error = None;
-        for _ in 0..5 {
-            if let Err(e) = self.advertise(c, true) {
-                error = Some(e)
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        error.map_or(Ok(()), Err)
+    pub fn restore(&self, c: &Config) -> crate::model::RecoveryReport {
+        crate::model::restore_with(
+            c,
+            5,
+            |packet| {
+                self.send(packet)
+                    .map_err(|e| format!("[NP_ARP_RESTORE] {e}"))
+            },
+            || std::thread::sleep(std::time::Duration::from_millis(100)),
+        )
     }
 }
 impl Drop for Capture {

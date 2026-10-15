@@ -1,6 +1,6 @@
-# NetPilot
+# NetPilot 0.1.1
 
-Experimental Windows desktop application in Rust, Tauri 2 and React for selected **owned home test devices**. Implements the requested SelfishNet-style IPv4 mechanism: targeted ARP redirection, Ethernet forwarding, separate upload/download shaping, and temporary IPv4 block/unblock. **Windows runtime is not yet validated. A successful build alone does not establish working enforcement on your extender topology.**
+Experimental Windows desktop application in Rust, Tauri 2 and React for selected **owned home test devices**. Implements the requested SelfishNet-style IPv4 mechanism: targeted ARP redirection, Ethernet forwarding, separate upload/download shaping, and temporary IPv4 block/unblock. **The owner has confirmed discovery and apparent temporary phone blocking in a first Windows trial, followed by an unresolved device-related error and recovery. Long-running enforcement and recovery are not validated. A successful build alone does not establish dependable control on the extender topology.**
 
 The earlier explicit proxy experiment is preserved locally on branch `experimental/connect-proxy`; it is not the application's current mechanism. No proxy configuration is required on devices.
 
@@ -14,7 +14,9 @@ The earlier explicit proxy experiment is preserved locally on branch `experiment
 - A bidirectional userspace Ethernet relay forwards selected IPv4 frames, rewriting only Ethernet MACs. IP/TCP/UDP data and checksums remain unchanged. Outgoing reinjected frames do not match the input filter, preventing relay loops. Windows IP forwarding must be disabled; NetPilot does not change that setting.
 - Aggregate per-device/per-direction pacing in **KiB/s**, based on forwarded Ethernet frame bytes. Independent bounded queues limit memory to 1 MiB per direction per device and queued delay to two seconds; excess frames are dropped. Low limits and UDP can therefore lose packets; this is not a lossless QoS service. NIC/kernel queues and framing affect observed rates.
 - Live upload/download updates and per-device **IPv4 block/unblock**. Blocking discards matching redirected IPv4 frames in both directions and clears queued frames. Changes are confirmed by the engine's next report, not by a mock slider.
-- Actual forwarded-byte and userspace dropped-frame counters. These are cumulative counts, not complete device bandwidth measurements or proof of traffic-path coverage. No payload logging or storage.
+- Actual incoming observed bytes, forwarded/submitted bytes and userspace dropped-frame counters. Current upload/download rates use byte deltas divided by the actual monotonic sample duration in KiB/s. Observed traffic includes attempts subsequently blocked or dropped; forwarded traffic is what Npcap accepted for transmission. Neither is complete-device or whole-network usage. Unselected devices are explicitly unobserved; stopped sessions do not display stale rates as live. No payload logging or storage.
+- On-demand system/local PTR names for up to 16 private on-link addresses in one request, with an eight-second process deadline and partial results retained. Unresolved names remain unknown. User labels are stored only in local app storage, keyed by adapter/IP/canonical MAC. Discovery does not guess device type or ownership.
+- Original error retention through restoration and helper shutdown, operation-specific Npcap errors, explicit stop reasons and lease countdown. A copyable bounded diagnostic report remains local unless the user chooses to share it.
 - Explicit start and stop; session lease 1–30 minutes. Restart requires a new explicit start. A global Windows mutex prevents two guardians from running simultaneously.
 
 ## Coverage limits
@@ -33,12 +35,12 @@ The UI spawns a guardian process with an independent Npcap recovery handle **bef
 - Guardian crash: engine notices pipe loss and restores using its own handle.
 - A stuck engine can be terminated by the guardian, which then attempts recovery independently.
 
-A successful Npcap send confirms transmission submission, **not acceptance by the gateway or device**. Killing both helpers, disabling the adapter, removing the driver, power loss, driver failure or endpoint rejection can prevent recovery. Reconnect the selected device's Wi-Fi/Ethernet to refresh its ARP cache; reboot it/router only if necessary and under your control. Do not treat recovery as guaranteed. No persistent Windows forwarding/firewall/router/DNS changes are made, and no driver/service is installed by NetPilot.
+Recovery now attempts every mapping even if a different mapping fails, and separately records send attempts and whether each mapping was submitted at least once. Transient failures are preserved without erasing the original engine error. A successful Npcap send confirms transmission submission, **not acceptance by the gateway or device**. Killing both helpers, disabling the adapter, removing the driver, power loss, driver failure or endpoint rejection can prevent recovery. Reconnect the selected device's Wi-Fi/Ethernet to refresh its ARP cache; reboot it/router only if necessary and under your control. Do not treat recovery as guaranteed. No persistent Windows forwarding/firewall/router/DNS changes are made, and no driver/service is installed by NetPilot.
 
 ## Windows prerequisites
 
 - Windows 10/11 x64 with WebView2; run NetPilot as administrator. The app reports missing privileges and does not auto-elevate.
-- Install Npcap separately from its [official site](https://npcap.com/). NetPilot **does not redistribute, silently install, or auto-download Npcap**. Follow its license terms and installer guidance. This build dynamically loads its API, so the Npcap SDK is not needed to compile.
+- The setup card detects the installed Npcap runtime, reports its version, administrator state and driver service state, reuses it across upgrades, and can recheck after an official installation without an app restart (relaunch is still needed to gain administrator rights). The user-initiated setup button opens only the official download page. Install Npcap separately from its [official site](https://npcap.com/). NetPilot **does not redistribute, silently install, or auto-download Npcap**. Follow its license terms and installer guidance. This build dynamically loads its API, so the Npcap SDK is not needed to compile.
 - Active physical Ethernet adapter with a private IPv4, on-link gateway and Windows IPv4 forwarding disabled. No VPN/virtual/Wi-Fi adapters are accepted by inventory. Check that Windows Internet Connection Sharing/routing is not enabled on the chosen adapter.
 - Owned test devices with distinct reachable on-link IPv4/MAC addresses and a topology accepting temporary ARP updates. Verify device ownership independently; MAC addresses are not authentication.
 
@@ -87,3 +89,23 @@ Main private source: [MrTayyem/NetPilot](https://github.com/MrTayyem/NetPilot). 
 - [Npcap nonblocking capture](https://npcap.com/guide/wpcap/pcap_setnonblock.html)
 - [Windows SendARP](https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-sendarp)
 - [Windows Get-NetNeighbor](https://learn.microsoft.com/en-us/powershell/module/nettcpip/get-netneighbor)
+
+## 0.1.1 repair and remaining diagnosis
+
+The remembered live error was "could not find the device" under NetPilot controls. The exact operation/Windows error code has not been captured. Device and gateway ARP resolution run only during discovery/setup/preflight; the active engine does not continuously look up the phone or stop merely because a blocked phone fails to answer. A raw Npcap adapter read/transmit error, identity change, helper timeout or session expiry can stop the session, but the remembered wording does not identify which happened.
+
+Confirmed defects repaired: recovery errors could hide the original failure; pending helper output could be lost at process exit; a normal closed heartbeat pipe could be reported as a failure; and one failed recovery mapping aborted attempts for later mappings. Regression tests cover primary-error retention, late error precedence, normal terminal shutdown, all-mapping recovery and partial send failure. The native driver failure itself is **not claimed fixed** until the owner repeats the test and captures its exact context.
+
+If the error recurs, use **Copy diagnostic report** immediately, before starting another session. It contains the app version, the first error, recovery outcome, selected IPv4 counters and up to 64 distinct lifecycle events with relative times. It contains no packet payloads and is not uploaded automatically. Codes distinguish `NP_PREFLIGHT`, `NP_ENGINE_OPEN`, `NP_RECOVERY_OPEN`, `NP_CAPTURE_READ`, `NP_FORWARD_TX`, `NP_ARP_REDIRECT`, `NP_ARP_RESTORE`, `NP_IDENTITY_CHANGE`, and helper watchdogs. For Npcap operation failures, "device" can mean the Windows capture adapter; it does not by itself establish that the phone disappeared.
+
+## Signed in-app updates
+
+0.1.1 bootstraps a Tauri 2 signed updater. **0.1.0 has no updater, so install 0.1.1 manually once.** The app checks once on startup and offers a manual check. Installation is explicit and displays progress/restart information. Before any download/install, Rust stops network helpers and checks the recovery outcome. New starts and rule updates are locked out until installation ends; an unconfirmed recovery blocks installation. No plugin install permission is granted to JavaScript, so it cannot skip the native lifecycle guard.
+
+The HTTPS manifest is `https://github.com/tayyemibraheem/NetPilot-build/releases/download/netpilot-updates/latest.json`. Each immutable build release contains an NSIS installer, `.sig`, checksum and matching manifest. The rolling channel points to that immutable payload only after the payload is signed and verified. `requireSignedVersion` binds the signed artifact to the manifest version, and the updater retains the default newer-version-only comparison. CI verifies the Ed25519 payload and trusted metadata signatures and rejects tampered bytes/metadata before delivery.
+
+Only the public verification key is embedded in the app. The private signing key is outside the source repositories in a protected local directory and in the build repository's encrypted Actions secret `TAURI_SIGNING_PRIVATE_KEY`; it is never committed or printed. Back it up securely: losing it prevents normal signed updates for existing installations. **Tauri update signing is not Windows Authenticode signing**; installers remain unsigned for Windows trust prompts. No certificate purchase or paid hosting/storage is configured. A real 0.1.1 → newer-version installation/restart test on Windows is still outstanding.
+
+## Npcap bundling limitation
+
+A DLL alone cannot replace Npcap's kernel driver. The free edition's redistribution terms do not allow bundling its installer/binaries as an ordinary NetPilot distribution; silent/all-in-one redistribution requires the appropriate OEM license. No license was purchased or assumed, and no Npcap binary is included in this public source or installer. The supported flow is a visible user-initiated official installation once, followed by setup detection and reuse. See [Npcap redistribution licensing](https://npcap.com/oem/redist), [Tauri updater requirements](https://v2.tauri.app/plugin/updater/) and [signed-version enforcement](https://docs.rs/tauri-plugin-updater/latest/tauri_plugin_updater/struct.Config.html).

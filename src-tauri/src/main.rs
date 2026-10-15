@@ -1,11 +1,71 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod diagnostics;
 mod model;
 #[cfg(windows)]
 mod pcap;
 mod platform;
 mod service;
+#[cfg(windows)]
+mod updater;
 mod worker;
 use tauri::Manager;
+#[tauri::command]
+fn driver_status() -> platform::DriverStatus {
+    platform::driver_status()
+}
+#[tauri::command]
+fn open_npcap_download() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        pcap::open_official_download()
+    }
+    #[cfg(not(windows))]
+    {
+        Err("Windows setup required".into())
+    }
+}
+#[tauri::command]
+async fn device_names(index: u32, ips: Vec<std::net::Ipv4Addr>) -> Result<platform::Names, String> {
+    tauri::async_runtime::spawn_blocking(move || platform::names(index, ips))
+        .await
+        .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+fn diagnostic_report(state: tauri::State<'_, service::Service>) -> String {
+    state.report()
+}
+#[derive(serde::Serialize)]
+struct UpdateInfo {
+    version: String,
+    notes: Option<String>,
+}
+#[tauri::command]
+async fn check_update(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
+    #[cfg(windows)]
+    {
+        Ok(updater::check(&app).await?.map(|u| UpdateInfo {
+            version: u.version,
+            notes: u.notes,
+        }))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Err("Updates are supported in the Windows application".into())
+    }
+}
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle, version: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        updater::install(app, version).await
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, version);
+        Err("Windows update installation required".into())
+    }
+}
 #[tauri::command]
 async fn adapters() -> Result<Vec<model::Adapter>, String> {
     tauri::async_runtime::spawn_blocking(platform::adapters)
@@ -74,9 +134,17 @@ fn main() {
     if worker::helper_mode() {
         return;
     }
-    tauri::Builder::default()
-        .manage(service::Service::default())
+    let builder = tauri::Builder::default().manage(service::Service::default());
+    #[cfg(windows)]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    builder
         .invoke_handler(tauri::generate_handler![
+            driver_status,
+            open_npcap_download,
+            device_names,
+            diagnostic_report,
+            check_update,
+            install_update,
             adapters,
             discover,
             scan,
