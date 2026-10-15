@@ -307,10 +307,9 @@ fn engine() -> Result<(), String> {
             .chain([arp_at, stats_at, deadline])
             .min()
             .unwrap_or(now + Duration::from_millis(100));
-        let wait = next
-            .saturating_duration_since(Instant::now())
-            .as_millis()
-            .min(100) as u32;
+        // Round a positive sub-millisecond delay up to avoid a pacing busy-spin.
+        let delay = next.saturating_duration_since(Instant::now());
+        let wait = delay.as_micros().div_ceil(1000).min(100) as u32;
         capture.wait(wait)?;
     }
     // Drop recovery before notifying guardian; guardian independently repeats recovery.

@@ -112,7 +112,7 @@ impl Capture {
                 return Err("Npcap capture event unavailable".into());
             }
             capture.set_filter(if filter {
-                capture_filter(c)
+                capture_filter(c)?
             } else {
                 "ether proto 0x0000".into()
             })?;
@@ -224,23 +224,25 @@ impl Drop for Capture {
         unsafe { (self.close)(self.handle) }
     }
 }
-fn capture_filter(c: &Config) -> String {
-    let gateway = &c.gateway_mac;
+fn capture_filter(c: &Config) -> Result<String, String> {
+    use crate::model::{mac, mac_text};
+    let gateway = mac_text(mac(&c.gateway_mac)?);
+    let local = mac_text(mac(&c.adapter.mac)?);
     let endpoints = c
         .rules
         .iter()
         .map(|r| {
-            format!(
-                "((ether src {} and src host {}) or (ether src {} and dst host {}))",
-                r.mac, r.ip, gateway, r.ip
-            )
+            let device = mac_text(mac(&r.mac)?);
+            Ok(format!(
+                "((ether src {device} and src host {}) or (ether src {gateway} and dst host {}))",
+                r.ip, r.ip
+            ))
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>, String>>()?
         .join(" or ");
-    format!(
-        "arp or (ether dst {} and ip and ({endpoints}))",
-        c.adapter.mac
-    )
+    Ok(format!(
+        "arp or (ether dst {local} and ip and ({endpoints}))"
+    ))
 }
 // Prevent two sessions (including sessions in other Windows logins) changing the same LAN.
 pub struct SessionLock(Handle);
