@@ -66,8 +66,13 @@ impl Service {
         let join = std::thread::spawn(move || {
             let mut last = Instant::now();
             let mut terminal = false;
+            let mut last_report = Instant::now();
+            let mut had_report = false;
             loop {
                 if s.load(Ordering::SeqCst) {
+                    break;
+                }
+                if last_report.elapsed() > Duration::from_secs(if had_report { 8 } else { 45 }) {
                     break;
                 }
                 for update in rx.try_iter() {
@@ -89,6 +94,8 @@ impl Service {
                 }
                 match messages.recv_timeout(Duration::from_millis(100)) {
                     Ok(v) => {
+                        last_report = Instant::now();
+                        had_report = true;
                         terminal = v.phase == "error" || v.phase == "stopped";
                         if let Ok(mut x) = status.lock() {
                             *x = v

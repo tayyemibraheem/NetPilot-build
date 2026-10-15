@@ -25,7 +25,7 @@ The user's topology is router Wi-Fi → extender → Ethernet Windows PC; other 
 
 ## Recovery design and limits
 
-The UI spawns a guardian process with an independent Npcap recovery handle **before** it starts the engine process. UI → guardian and guardian → engine pipes carry heartbeats; pipe EOF or a heartbeat gap over three seconds requests shutdown. The engine has an independent finite lease and aborts on detected enrolled ARP identity changes or capture/injection errors.
+The UI spawns a guardian process with an independent Npcap recovery handle **before** it starts the engine process. UI → guardian and guardian → engine pipes carry heartbeats; pipe EOF or a heartbeat gap over three seconds requests shutdown. The guardian also watches engine progress (four-second report gap after startup) and enforces an independent session deadline. The UI detects a silent guardian and closes its pipe. The engine has an independent finite lease and aborts on detected enrolled ARP identity changes or capture/injection errors.
 
 - Normal stop/close: engine stops forwarding and sends each original mapping five times; guardian waits for the engine and repeats recovery with its own handle.
 - UI crash: guardian notices closed pipe, stops engine and restores.

@@ -161,8 +161,17 @@ fn guardian() -> Result<(), String> {
     let messages = read_messages(&mut child);
     let heart = Heart::new(input);
     let mut failure = None;
+    let mut last_report = Instant::now();
+    let mut engine_started = false;
+    let lease = Instant::now() + Duration::from_secs(c.duration_minutes as u64 * 60 + 15);
     loop {
         if heart.expired() {
+            break;
+        }
+        if Instant::now() >= lease
+            || last_report.elapsed() > Duration::from_secs(if engine_started { 4 } else { 15 })
+        {
+            failure = Some("Engine lease or progress watchdog expired; recovery requested".into());
             break;
         }
         for update in heart.updates.try_iter() {
@@ -194,6 +203,8 @@ fn guardian() -> Result<(), String> {
         }
         match messages.recv_timeout(Duration::from_millis(250)) {
             Ok(s) => {
+                last_report = Instant::now();
+                engine_started |= s.phase == "active";
                 let terminal = s.phase == "error" || s.phase == "stopped";
                 emit(&s);
                 if terminal {
